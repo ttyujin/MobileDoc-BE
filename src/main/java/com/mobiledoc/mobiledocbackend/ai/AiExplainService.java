@@ -2,6 +2,9 @@ package com.mobiledoc.mobiledocbackend.ai;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.mobiledoc.mobiledocbackend.ai.dto.ChatMessage;
+import com.mobiledoc.mobiledocbackend.ai.dto.ChatRequest;
+import com.mobiledoc.mobiledocbackend.ai.dto.ChatResponse;
 import com.mobiledoc.mobiledocbackend.ai.dto.ExplainDecisionRequest;
 import com.mobiledoc.mobiledocbackend.ai.dto.ExplainDecisionResponse;
 import org.springframework.stereotype.Service;
@@ -15,11 +18,234 @@ public class AiExplainService {
 
     private final ObjectMapper om = new ObjectMapper();
 
+    // ✅ 고객센터 번호 고정 (프론트 정책)
+    private static final String DEFAULT_CC_PHONE = "010-4227-5689";
+
     private boolean hasOpenAiKey() {
         String key = System.getenv("OPENAI_API_KEY");
         return key != null && !key.isBlank();
     }
 
+    // =========================
+    // ✅ 챗봇: /ai/chat
+    // =========================
+    public ChatResponse chat(ChatRequest req) {
+        String category = normalizeCategory(req != null ? req.category : null);
+        String userText = (req != null) ? req.getUserText() : "";
+        Map<String, Object> context = (req != null) ? req.context : null;
+        List<ChatMessage> history = (req != null) ? req.history : null;
+
+        String phone = DEFAULT_CC_PHONE;
+        if (req != null && req.customerCenterPhone != null && !req.customerCenterPhone.isBlank()) {
+            phone = req.customerCenterPhone.trim();
+        }
+
+        if (userText == null) userText = "";
+        userText = userText.trim();
+
+        // ✅ 키 없으면 폴백(프론트 에러 없이 동작)
+        if (!hasOpenAiKey()) {
+            String fb = chatFallback(category, userText, context, phone);
+            fb = enforceContactPhone(category, fb, phone);
+            return new ChatResponse(fb);
+        }
+
+        try {
+            String prompt = buildChatPrompt(category, userText, context, history, phone);
+
+            // 챗봇은 길게 나올 수 있으니 넉넉히
+            int maxTokens = 900;
+
+            String reply = OpenAiClientFacade.callResponsesApi(prompt, maxTokens);
+            if (reply == null || reply.isBlank()) {
+                String fb = chatFallback(category, userText, context, phone);
+                fb = enforceContactPhone(category, fb, phone);
+                return new ChatResponse(fb);
+            }
+
+            reply = postProcessSafety(reply, userText);
+            reply = enforceContactPhone(category, reply, phone);
+
+            return new ChatResponse(reply.trim());
+        } catch (Exception e) {
+            String fb = chatFallback(category, userText, context, phone);
+            fb = enforceContactPhone(category, fb, phone);
+            return new ChatResponse(fb);
+        }
+    }
+
+    private String normalizeCategory(String c) {
+        if (c == null) return "decision";
+        String x = c.trim().toLowerCase();
+        return switch (x) {
+            case "visits", "symptoms", "decision", "contact" -> x;
+            default -> "decision";
+        };
+    }
+
+    private String buildChatPrompt(
+            String category,
+            String userText,
+            Map<String, Object> context,
+            List<ChatMessage> history,
+            String customerCenterPhone
+    ) {
+        String policy = """
+                너는 MobileDoc 앱의 챗봇이다. 한국어로 답한다.
+
+                절대 규칙(중요):
+                - 의료 진단/처방/약 추천을 하지 마라. (절차/안전/정책 안내만)
+                - 사용자가 응급으로 보이면 '119/응급실' 우선 안내를 반드시 포함해라.
+                - 아래 context에 있는 정보만 근거로 말해라. context에 없으면 "현재 기록이 없어서 단정할 수 없다"라고 말해라. (날조 금지)
+                - category가 contact이면 답변에 고객센터 번호 %s 를 반드시 포함해라.
+                """.formatted(customerCenterPhone);
+
+        String categoryRule = switch (category) {
+            case "visits" -> """
+                    category=visits (방문병원)
+                    - context에 방문 기록/자주 간 병원 정보가 있으면 그것을 요약해라.
+                    - 없으면 기록이 없다고 말하고, 어떤 정보를 입력/저장하면 정리가 가능한지 안내해라.
+                    - 형식: 요약 1~2문장 + 목록(있으면) + 다음 행동 1~2개.
+                    """;
+            case "symptoms" -> """
+                    category=symptoms (증상통계)
+                    - context에 증상/진료과/방문 통계가 있으면 '횟수/패턴' 중심으로 요약해라.
+                    - 통계가 없으면 통계 데이터가 없다고 말하고, 무엇이 기록돼야 통계가 되는지 안내해라.
+                    - 질병 추정/진단은 금지.
+                    """;
+            case "decision" -> """
+                    category=decision (최근판별)
+                    - context에 lastDecision / reasons / summary가 있으면, 쉬운 말로 풀어 설명해라.
+                    - 없으면 최근 판별 기록이 없다고 말하고, 어떤 정보가 필요할지 안내해라.
+                    - 안전 안내(악화/응급 시 대면/응급)도 덧붙여라.
+                    """;
+            case "contact" -> """
+                    category=contact (고객센터)
+                    - 1) 확인 질문 2) 간단 해결 체크리스트 3) 고객센터 안내 순서로 답해라.
+                    - 반드시 고객센터 번호를 포함해라.
+                    """;
+            default -> "category=decision";
+        };
+
+        String historyText = safeHistory(history);
+        String ctx = safeToJson(context);
+
+        return """
+                %s
+
+                %s
+
+                (대화 히스토리 - 있으면 참고)
+                %s
+
+                (context - 이 정보만 근거로 사용)
+                %s
+
+                (사용자 질문)
+                %s
+
+                답변 스타일:
+                - 짧은 문장 위주, 어려운 용어 금지
+                - 필요한 경우에만 항목/번호로 정리
+                - 길이는 6~14문장 정도(카테고리에 맞게)
+                """.formatted(policy, categoryRule, historyText, ctx, safe(userText));
+    }
+
+    private String safeHistory(List<ChatMessage> history) {
+        if (history == null || history.isEmpty()) return "(없음)";
+        StringBuilder sb = new StringBuilder();
+        int start = Math.max(0, history.size() - 10);
+        for (int i = start; i < history.size(); i++) {
+            ChatMessage m = history.get(i);
+            if (m == null) continue;
+            String role = (m.role == null) ? "unknown" : m.role.trim();
+            String content = (m.content == null) ? "" : m.content.trim();
+            if (content.isBlank()) continue;
+            sb.append("- ").append(role).append(": ").append(content.replace("\n", " ")).append("\n");
+        }
+        String out = sb.toString().trim();
+        return out.isBlank() ? "(없음)" : out;
+    }
+
+    private String chatFallback(String category, String userText, Map<String, Object> context, String phone) {
+        boolean emergency = looksEmergency(userText);
+
+        String emergencyLine = emergency
+                ? "지금 증상이 심하거나 급격히 악화 중이면, 먼저 119/응급실을 우선으로 고려해 주세요.\n\n"
+                : "";
+
+        return switch (category) {
+            case "visits" -> emergencyLine + """
+                    방문병원 정리는 “저장된 기록”이 있을 때 정확해요.
+                    지금은 서버에 넘어온 방문 기록(context)이 없어서 단정해서 정리하긴 어려워요.
+
+                    가능하면 아래 정보를 알려주면 바로 정리해줄 수 있어요:
+                    - 병원 이름(또는 자주 간 병원)
+                    - 최근 방문 날짜/목적(간단히)
+                    """;
+            case "symptoms" -> emergencyLine + """
+                    증상 통계는 기록이 있어야 정확히 계산돼요.
+                    지금은 서버에 넘어온 통계(context)가 없어서 “몇 번” 같은 숫자를 확정할 수 없어요.
+
+                    통계를 원하면:
+                    - 증상/진료과 선택 기록
+                    - 방문/상담 기록
+                    이 두 가지가 쌓여야 해요.
+                    """;
+            case "decision" -> emergencyLine + """
+                    최근 판별 결과를 설명하려면 lastDecision / reasons 같은 기록이 필요해요.
+                    지금은 서버에 넘어온 판별 정보(context)가 없어서 “왜 조건부인지”를 정확히 특정할 수 없어요.
+
+                    만약 결과 화면에서 본 문구(요약/근거)를 그대로 붙여주면,
+                    그 근거를 바탕으로 쉽게 풀어서 설명해줄게요.
+                    """;
+            case "contact" -> emergencyLine + """
+                    로그인/계정 문제가 있을 때는 아래부터 빠르게 확인해 주세요.
+                    1) 비밀번호 재설정(메일/인증) 진행 여부
+                    2) 대소문자/공백/자동완성으로 이메일이 달라지지 않았는지
+                    3) 다른 네트워크(와이파이/데이터)에서도 동일한지
+
+                    그래도 해결이 안 되면 고객센터로 문의해 주세요: %s
+                    """.formatted(phone);
+            default -> emergencyLine + "지금은 해당 요청을 처리할 정보가 부족해요. 질문을 조금만 더 자세히 알려주세요.";
+        };
+    }
+
+    private String enforceContactPhone(String category, String reply, String phone) {
+        if (!"contact".equals(category)) return reply;
+        if (reply == null) reply = "";
+        if (reply.contains(phone)) return reply;
+        return reply.trim() + "\n\n고객센터: " + phone;
+    }
+
+    private String postProcessSafety(String reply, String userText) {
+        if (reply == null) return "";
+        String out = reply.trim();
+
+        // 응급으로 보이면 119 안내를 보강
+        if (looksEmergency(userText) && !out.contains("119") && !out.contains("응급실")) {
+            out = "지금 증상이 심하거나 급격히 악화 중이면, 먼저 119/응급실을 우선으로 고려해 주세요.\n\n" + out;
+        }
+        return out;
+    }
+
+    private boolean looksEmergency(String text) {
+        if (text == null) return false;
+        String t = text.toLowerCase();
+        String[] keys = new String[] {
+                "호흡", "숨", "가슴통증", "흉통", "의식", "실신", "마비", "경련",
+                "피가", "출혈", "극심", "응급", "119", "심한 통증", "숨쉬기",
+                "자살", "자해"
+        };
+        for (String k : keys) {
+            if (t.contains(k.toLowerCase())) return true;
+        }
+        return false;
+    }
+
+    // =========================
+    // ✅ 기존 explain-decision (너가 준 코드 그대로)
+    // =========================
     public ExplainDecisionResponse explain(ExplainDecisionRequest req) {
         String level = (req != null && req.decisionLevel != null) ? req.decisionLevel : "conditional";
         Map<String, Object> answers = (req != null) ? req.answers : null;
